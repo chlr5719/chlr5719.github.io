@@ -5,12 +5,14 @@
 
 文件说明:   此文件提供用户界面，方面用户测试CSD板卡
 
-当前版本:   V1.3
+当前版本:   V1.5
 
 修改记录:   2012-12-06  V1.0    王鹤翔  创建
             2013-01-09  V1.1    王鹤翔  修改    根据新版驱动重新编写
             2014-02-25  V1.2    徐佳谋  修改    微调代码
             2015-12-25  V1.3    徐佳谋  修改    配合驱动修改
+            2016-04-05  V1.4    徐佳谋  增加    配合驱动修改，同时增加计数等功能
+            2016-04-14  V1.5    王  明  修改    配合驱动修改，修改测试程序，添加标准帧发送
 ********************************************************************/
 
 #include "vxWorks.h"
@@ -22,14 +24,37 @@
 
 #include "IsaSjaLib.h"
 
+/* 实际CAN通道数 */
+#define CURRENT_SJA_NUM         (8)
+#define DEBUG                   1
+
+
+/* CSD板卡资源信息 */
+typedef struct csd_info_s
+{
+    int base0;
+    int base;
+    int irq;
+} csd_info_t;
+
+csd_info_t g_infos[MAX_SJA_NUM] =
+{
+    {0x311, 0xd000, 5},
+    {0x311, 0xd100, 5},
+    {0x311, 0xd200, 5},
+    {0x311, 0xd300, 5},
+    {0x311, 0xd400, 5},
+    {0x311, 0xd500, 5},
+    {0x311, 0xd600, 5},
+    {0x311, 0xd700, 5},
+};
+
 int g_csd_debug = 1;
-int g_counts[MAX_SJA_NUM];
+long g_transmit_counts[MAX_SJA_NUM];
+long g_received_counts[MAX_SJA_NUM];
 
-int CallBack(int fdv);
-int InitSja(void);
-int WriteCan(void);
-int CloseCan(void);
-
+int InitSja(int fd, int BaudRate);
+int tCanRecv(int fd);
 static int GetKeyInput(int radix);
 
 /********************************************************************
@@ -96,46 +121,103 @@ static int GetKeyInput(int radix)
             并根据用户选择进行不同的功能测试，具体的测试功能由单独的函数实现
 
 修改记录:   2012-12-06      王鹤翔  创建
+            2016-04-14      王  明  修改  根据修改后的驱动修改部分函数名称
 ********************************************************************/
 int TestSja(void)
 {
-    int select = 0;
+    int input = 0;
     int ret = 0;
+    int i = 0;
+    int recv_tid[CURRENT_SJA_NUM] = {0};
+
+    memset(g_received_counts, 0, sizeof(g_received_counts));
+    memset(g_transmit_counts, 0, sizeof(g_transmit_counts));
+
+    /* 初始化SJA1000芯片 */
+    for (i = 0; i < CURRENT_SJA_NUM; i++)
+    {
+        ret = InitSja(i, BAUDRATE_500K);
+        if (ret != 0)
+        {
+            printf("InitSja failed!%d\n", ret);
+
+            continue ;
+        }
+    }
+
+    /* 创建接收任务 */
+    for(i = 0; i < CURRENT_SJA_NUM; i++)
+    {
+        recv_tid[i] = taskSpawn("tCanRecv", 98, 0, 8192, tCanRecv, i, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
 
     printf("\nISA Sja1000 Test Program\n");
 
-    InitSja();
-
     /* 打印菜单 */
-    for (;;)
+    for(input = 100;;)
     {
-        printf("\n"
-               "1. CAN Test\n"
-               "99. Exit\n");
-
-        printf("Your choice: %d\n", select = GetKeyInput(10));
-
-        switch (select)
+        switch(input)
         {
+        case 98:
+            g_csd_debug = !g_csd_debug;
+            break;
+
         case 99:
-        {
             printf("Exit Program, exit code = %d\n", CloseSja());
             goto Exit;
-        }
+
         case 1:
-        {
             printf("return = %d\n", TransmitSja());
             break;
-        }
-        default:
-        {
-            printf("Invalid select, retry!\n");
+
+        case 2: /* 显示接收计数 */
+            for (i = 0; i < MAX_SJA_NUM; i++)
+            {
+                printf("R%d=%11d  ", i, g_received_counts[i]);
+            }
+            printf("\n");
+            for (i = 0; i < MAX_SJA_NUM; i++)
+            {
+                printf("T%d=%11d  ", i, g_transmit_counts[i]);
+            }
+            printf("\n");
             break;
-        }
+
+        case 3: /* 清除计数 */
+            for (i = 0; i < MAX_SJA_NUM; i++)
+            {
+                g_received_counts[i] = 0;
+                g_transmit_counts[i] = 0;
+
+                /* 清除FIFO */
+                ret = FlushIsaCan(i);
+                if (ret != 0)
+                {
+                    printf("channel %d FlushIsaCan failed!%d\n", i, ret);
+                }
+            }
+            printf("Counts are clean.\n");
+            break;
+
+        default:
+            printf("1.  Transmit data\n"
+                   "2.  Dispaly  Counts\n"
+                   "3.  Clear    counts\n"
+                   "98. Swtich debug onoff (debug = %d 0:off 1:on)\n"
+                   "99. Quit\n", g_csd_debug);
         } /* end switch */
+
+        printf("%d\n", input = GetKeyInput(10));
     } /* end for */
 
 Exit:
+    /* 删除接收任务 */
+    for(i = 0; i < CURRENT_SJA_NUM; i++)
+    {
+        CloseSja(i);
+        taskDelete(recv_tid[i]);
+    }
+
     return 0;
 }
 
@@ -152,14 +234,19 @@ Exit:
 
 修改记录:   2012-12-06      王鹤翔  创建
             2013-01-09      王鹤翔  修改  根据新版驱动重新编写
+            2016-04-14      王  明  修改  根据修改后的驱动修改部分函数名称，添加标准帧发送
 ********************************************************************/
 int TransmitSja(void)
 {
     int RunTimes = 0;
     int i = 0;
     int ret = 0;
-    Can_TPacket_t TxPacket;
+    sja1000_frame_t frame;
     int fd = 0;
+    int FrameFormat = 0;
+
+    /* 清零发送数据 */
+    memset(frame, 0, sizeof(sja1000_frame_t));
 
     /* 指定发送CAN口 */
     printf("Input Transmit CAN Number(0-%d: CAN1-can%d):\n", MAX_SJA_NUM - 1, MAX_SJA_NUM);
@@ -169,24 +256,65 @@ int TransmitSja(void)
     printf("CAN Test, Input Transmit Count(1-10000):\n");
     RunTimes = GetKeyInput(10) % 10000;
 
-    TxPacket.uchFF = 0x88;
-    TxPacket.uchID[0] = 0x11;
-    TxPacket.uchID[1] = 0x22;
-    TxPacket.uchID[2] = 0x33;
-    TxPacket.uchID[3] = 0x44;
-    memset(TxPacket.uchDATA, 0x55, 8);
+    printf("CAN Test, Input Transmit frame format (0:Standard frame 1:Extended frame):\n");
+    FrameFormat = GetKeyInput(10) % 2;
+
+    if(FrameFormat == 0) /* 标准帧，注意标准帧最长11字节，ID一共11位 */
+    {
+        /* header */
+        frame.header = 0x08;
+
+        /* ID */
+        frame.buffer[0] = 0x00; /* ID */
+        frame.buffer[1] = 0x00; /* ID 高3位有效 */
+
+        /* DATA */
+        frame.buffer[2] = 0x33;
+        frame.buffer[3] = 0x40;
+        frame.buffer[4] = 0x55;
+        frame.buffer[5] = 0x66;
+        frame.buffer[6] = 0x77;
+    }
+    else if(FrameFormat == 1) /* 扩展帧，注意扩展帧最长13字节，ID一共29位*/
+    {
+        /* header */
+        frame.header = 0x88;
+
+        /* ID */
+        frame.buffer[0] = 0x11; /* ID */
+        frame.buffer[1] = 0x22; /* ID */
+        frame.buffer[2] = 0x33; /* ID */
+        frame.buffer[3] = 0x40; /* ID 高5位有效 */
+
+        /* DATA */
+        frame.buffer[4] = 0x55;
+        frame.buffer[5] = 0x66;
+        frame.buffer[6] = 0x77;
+        frame.buffer[7] = 0x88;
+        frame.buffer[8] = 0x99;
+    }
 
     for (i = 0; i < RunTimes; i++)
     {
-        TxPacket.uchDATA[7] = i;
-        ret |= CAN_SendMsg(fd, &TxPacket);
+        if(FrameFormat == 0)
+        {
+            frame.buffer[7] = i;
+        }
+        else
+        {
+            frame.buffer[9] = i;
+        }
+
+        ret |= WriteIsaCan(fd, &frame);
         if(ret != SUCCESS)
         {
             printf("can%d send failed! ret = %d, i = %d\n", fd, ret, i);
             return ret;
         }
-        taskDelay(sysClkRateGet() / 2);    /* 这里需要加延时，否则芯片会一直产生接收中断，
-                               驱动会不停的进入中断服务程序，导致不能调用回调函数 */
+
+        g_transmit_counts[fd] += 1;
+
+        taskDelay(sysClkRateGet() / 2);    /* 这里需要加延时，否则芯片会一直产生接收中断 */
     }
 
     return ret;
@@ -198,6 +326,7 @@ int TransmitSja(void)
 函数功能:   初始化驱动和SJA1000芯片
 
 参数名称        类型            输入/输出           含义
+BaudRate        int             input               波特率
 
 返回值  :   0代表成功 非0代表失败
 
@@ -205,16 +334,28 @@ int TransmitSja(void)
 
 修改记录:   2012-12-06      王鹤翔  创建
             2013-01-09      王鹤翔  修改  根据新版驱动重新编写
+            2016-04-14      王  明  修改  根据修改后的驱动修改代码
 ********************************************************************/
-int InitSja(void)
+int InitSja(int fd, int BaudRate)
 {
     int ret = 0;
-    int i = 0;
     sja1000_config_t config;
+    sja1000_filter_t AcceptFilter;
 
-    config.uchMOD = 0x09;   /* 进入reset模式，单滤波，唤醒，非自测，非监听模式 */
-    config.uchBTR0 = 0x00;  /* 500Kbps */
-    config.uchBTR1 = 0x1C;
+
+    /* 打开驱动 */
+    ret = OpenIsaCan(fd, g_infos[fd].base0, g_infos[fd].base, g_infos[fd].irq);
+    if(ret != SUCCESS)
+    {
+        printf("OpenIsaCan failed!fd = %d ret = %d\n", fd, ret);
+
+        return -1;
+    }
+
+    /* 初始化SJA1000芯片 */
+    config.uchMOD = 0x08;           /* 单滤波，唤醒，非自测，非监听模式 */
+    config.uchBTR0   = BaudRate >> 8;
+    config.uchBTR1   = BaudRate;    /* 波特率 */
     config.uchACR[0] = 0;
     config.uchACR[1] = 0;
     config.uchACR[2] = 0;
@@ -225,57 +366,42 @@ int InitSja(void)
     config.uchAMR[3] = 0xff;
     config.uchCDR = 0xc4;
     config.uchOCR = 0xda;
-    config.uchIER = 0x81;
+    config.uchIER = 0x83;
 
-    /* 打开驱动 */
-    ret = CAN_Open(0, 0x300, 0xd400, 5, 4096, 49);
+    ret = IoctlIsaCan(fd, IOCTL_INIT_SJA, &config);
+        if(ret != SUCCESS)
+    {
+        printf("Init isa can Failed!fd = %d ret = %d\n", fd, ret);
+
+        return -1;
+    }
+
+    /*  动态设置接收滤波器 */
+    AcceptFilter.MaskMode = SINGLE_FILTER;
+    AcceptFilter.uchACR[0] = 0x00;
+    AcceptFilter.uchACR[1] = 0x00;
+    AcceptFilter.uchACR[2] = 0x00;
+    AcceptFilter.uchACR[3] = 0x00;
+    AcceptFilter.uchAMR[0] = 0xff;
+    AcceptFilter.uchAMR[1] = 0xff;
+    AcceptFilter.uchAMR[2] = 0xff;
+    AcceptFilter.uchAMR[3] = 0xff;
+
+    ret = IoctlIsaCan(fd, SET_ACCEPT_FILTER, &AcceptFilter);
     if(ret != SUCCESS)
     {
-        printf("Can%d CAN_Open failed!%d\n", 0, ret);
+        printf("Set mask Failed!fd = %d ret = %d\n", fd, ret);
 
-        return ;
+        return -1;
     }
-
-    /* 初始化SJA1000芯片 */
-    ret = CAN_Init(0, &config);
-    if(ret != SUCCESS)
-    {
-        printf("Can%d CAN_Init Failed!%d\n", 0, ret);
-        
-        return ;
-    }
-
-    /* 安装回调函数 */
-    CAN_InstallCallBack(0, CallBack);
-
-    /* 打开驱动 */
-    ret = CAN_Open(1, 0x300, 0xd800, 7, 4096, 49);
-    if(ret != SUCCESS)
-    {
-        printf("Can%d CAN_Open failed!%d\n", 1, ret);
-
-        return ;
-    }
-
-    /* 初始化SJA1000芯片 */
-    ret = CAN_Init(1, &config);
-    if(ret != SUCCESS)   /* 初始化SJA1000芯片 */
-    {
-        printf("Can%d CAN_Init Failed!%d\n", 1, ret);
-        
-        return ;
-    }
-
-    /* 安装回调函数 */
-    CAN_InstallCallBack(1, CallBack);
 
     return ret;
 }
 
 /********************************************************************
-函数名称:   CallBack
+函数名称:   tCanRecv
 
-函数功能:   回调函数
+函数功能:   接收任务
 
 参数名称        类型            输入/输出           含义
 fd              int             input               设备文件索引(0-4)
@@ -287,35 +413,32 @@ fd              int             input               设备文件索引(0-4)
 修改记录:   2010-09-16      王鹤翔  创建
             2013-01-09      王鹤翔  修改    根据新版驱动重新编写
             2015-12-25      徐佳谋  修改    配合驱动修改
+            2016-04-14      王  明  修改    将回调改为任务
 ********************************************************************/
-int CallBack(int fd)
+int tCanRecv(int fd)
 {
-    unsigned char RxBuffer[CAN_FRAME_SIZE] = {0};
+    sja1000_frame_t frame;
     int ret = 0;
     int i = 0;
 
     for(;;)
     {
-        memset(RxBuffer, 0, sizeof(RxBuffer));
-        ret = CAN_ReadMsg(fd, RxBuffer, sizeof(RxBuffer));    /* 读取接收数据 */
-        if (ret <= 0)
+        ret = ReadIsaCan(fd, &frame);    /* 读取接收数据 */
+        if(ret <= 0)
         {
-            break;
+            continue;
         }
 
-        g_counts[fd] += ret / CAN_FRAME_SIZE;
-        if (g_csd_debug)
+        g_received_counts[fd] += ret / CAN_FRAME_SIZE;
+        if(g_csd_debug)
         {
             printf("--- ");
-            for (i = 0; i < CAN_FRAME_SIZE; i++)
+            printf("%02X ", frame.header);
+            for (i = 0; i < CAN_FRAME_SIZE - 1; i++)
             {
-                printf("%02X ", RxBuffer[i]);
+                printf("%02X ", frame.buffer[i]);
             }
-            printf("--- can%d received %4d frames\n", fd, g_counts[fd]);
-        }
-        else
-        {
-            printf("can%d received %4d frames\n", fd, g_counts[fd]);
+            printf("--- can%d received %4d frames\n", fd, g_received_counts[fd]);
         }
     }
 
@@ -335,6 +458,7 @@ int CallBack(int fd)
 
 修改记录:   2012-12-06      王鹤翔  创建
             2013-01-09      王鹤翔  修改  根据新版驱动重新编写
+            2016-04-14      王  明  修改  根据修改后的驱动修改部分函数名称
 ********************************************************************/
 int CloseSja(void)
 {
@@ -342,7 +466,7 @@ int CloseSja(void)
 
     for(i = 0; i < MAX_SJA_NUM; i++)
     {
-        CAN_Close(i);
+        CloseIsaCan(i);
     }
 
     return 0;
